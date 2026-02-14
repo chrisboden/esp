@@ -62,11 +62,17 @@ const char* SYSTEM_PROMPT =
 // ---- Globals ----
 TFT_eSPI tft = TFT_eSPI();
 volatile bool wifiConnected = false;
+volatile bool wifiNeedsReconnect = false;
 volatile int  disconnectCount = 0;
 volatile int  lastDisconnectReason = 0;
+unsigned long lastReconnectAttempt = 0;
 uint64_t configuredInputs = 0, configuredOutputs = 0;
 bool agentRunning = false;
 uint16_t resultBgColor = COL_IDLE;  // background for final answer display
+
+// ---- Persistent TLS connection to OpenRouter ----
+WiFiClientSecure* apiClient = nullptr;
+bool apiClientConnected = false;
 
 // =============================================
 // Display helpers
@@ -102,15 +108,17 @@ void showStatus() {
 void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      wifiConnected = false;
+      wifiNeedsReconnect = true;
+      apiClientConnected = false;  // TLS connection is dead
       disconnectCount++;
       lastDisconnectReason = info.wifi_sta_disconnected.reason;
-      Serial.printf("[wifi] Disconnect #%d reason=%d, retrying...\n",
+      Serial.printf("[wifi] Disconnect #%d reason=%d\n",
                     disconnectCount, lastDisconnectReason);
-      delay(500);
-      esp_wifi_connect();
       break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       wifiConnected = true;
+      wifiNeedsReconnect = false;
       Serial.printf("[wifi] Connected! IP: %s\n",
                     WiFi.localIP().toString().c_str());
       break;
@@ -121,6 +129,8 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 
 bool connectWiFi() {
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);          // disable modem sleep — improves reliability
+  WiFi.setAutoReconnect(true);   // SDK-level auto-reconnect
   WiFi.onEvent(WiFiEvent);
 
   wifi_country_t country = {
@@ -301,25 +311,54 @@ void buildTools(JsonArray tools) {
 
 bool ensureWiFi() {
   if (WiFi.status() == WL_CONNECTED) return true;
-  Serial.println("[wifi] Not connected, waiting...");
+  Serial.println("[wifi] Not connected, triggering reconnect...");
   showScreen(COL_ERROR, "WiFi reconnecting...");
-  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) delay(500);
+  esp_wifi_connect();
+  for (int i = 0; i < 30 && WiFi.status() != WL_CONNECTED; i++) delay(500);
   return WiFi.status() == WL_CONNECTED;
+}
+
+void ensureApiClient() {
+  if (apiClient && apiClientConnected && apiClient->connected()) return;
+
+  // Clean up old client if it exists
+  if (apiClient) {
+    apiClient->stop();
+    delete apiClient;
+    apiClient = nullptr;
+    apiClientConnected = false;
+  }
+
+  Serial.printf("[api] New TLS connection, heap=%d\n", ESP.getFreeHeap());
+  apiClient = new WiFiClientSecure();
+  apiClient->setInsecure();
+  apiClient->setTimeout(30);  // 30s timeout
+
+  if (apiClient->connect("openrouter.ai", 443)) {
+    apiClientConnected = true;
+    Serial.println("[api] TLS connected");
+  } else {
+    Serial.println("[api] TLS connect failed");
+    delete apiClient;
+    apiClient = nullptr;
+    apiClientConnected = false;
+  }
 }
 
 int postChat(const String& body, JsonDocument& resp) {
   if (!ensureWiFi()) return -1;
 
-  Serial.printf("[api] heap before TLS: %d\n", ESP.getFreeHeap());
+  Serial.printf("[api] heap before POST: %d\n", ESP.getFreeHeap());
 
-  WiFiClientSecure* client = new WiFiClientSecure();
-  client->setInsecure();
+  ensureApiClient();
+  if (!apiClient) return -1;
 
   HTTPClient http;
-  http.begin(*client, API_URL);
+  http.begin(*apiClient, API_URL);
   http.setTimeout(30000);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Authorization", String("Bearer ") + API_KEY);
+  http.addHeader("Connection", "keep-alive");
 
   Serial.printf("[api] POST %d bytes...\n", body.length());
   int code = http.POST(body);
@@ -336,12 +375,17 @@ int postChat(const String& body, JsonDocument& resp) {
   }
 
   http.end();
-  client->stop();
-  delay(100);
-  delete client;
-  delay(100);
 
-  Serial.printf("[api] heap after cleanup: %d\n", ESP.getFreeHeap());
+  // If the request failed, tear down the connection so next call gets a fresh one
+  if (code <= 0) {
+    Serial.println("[api] Request failed, closing TLS");
+    apiClient->stop();
+    delete apiClient;
+    apiClient = nullptr;
+    apiClientConnected = false;
+  }
+
+  Serial.printf("[api] heap after: %d\n", ESP.getFreeHeap());
   return code;
 }
 
@@ -495,14 +539,21 @@ void setup() {
 }
 
 void loop() {
-  // WiFi reconnect
-  if (WiFi.status() != WL_CONNECTED && !wifiConnected) {
-    Serial.println("[wifi] Lost connection, reconnecting...");
-    wifiConnected = false;
-    showScreen(COL_ERROR, "WiFi lost...");
-    esp_wifi_connect();
-    for (int i = 0; i < 60 && !wifiConnected; i++) delay(500);
-    if (wifiConnected) showStatus();
+  // WiFi reconnect — with 5s cooldown between attempts
+  if (wifiNeedsReconnect && !agentRunning) {
+    unsigned long now = millis();
+    if (now - lastReconnectAttempt > 5000) {
+      lastReconnectAttempt = now;
+      Serial.printf("[wifi] Reconnecting (reason=%d)...\n", lastDisconnectReason);
+      showScreen(COL_ERROR, "WiFi reconnecting...");
+      esp_wifi_connect();
+      // Wait up to 15s for connection
+      for (int i = 0; i < 30 && !wifiConnected; i++) delay(500);
+      if (wifiConnected) {
+        Serial.println("[wifi] Reconnected OK");
+        showStatus();
+      }
+    }
   }
 
   // Button input (ignore while agent is running)
