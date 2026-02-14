@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(arduino-cli:*)",
+      "Bash(esptool:*)",
+      "Bash(esptool.py:*)",
+      "Bash(python3:*)",
+      "Bash(pip3:*)",
+      "Bash(system_profiler:*)",
+      "Bash(ioreg:*)",
+      "Bash(ls:*)",
+      "Bash(which:*)",
+      "Bash(strings:*)",
+      "Bash(xxd:*)",
+      "Bash(screen:*)",
+      "Bash(stty:*)"
+    ]
+  }
+}
