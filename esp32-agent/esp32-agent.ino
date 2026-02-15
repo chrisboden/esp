@@ -15,8 +15,8 @@
 // ---- Config ----
 const char* MODEL          = "openai/gpt-5.2-codex";
 const char* API_URL        = "https://openrouter.ai/api/v1/chat/completions";
-const int   MAX_TOKENS     = 300;
-const int   MAX_ITERATIONS = 8;
+const int   MAX_TOKENS     = 600;
+const int   MAX_ITERATIONS = 12;
 
 // ---- Buttons ----
 #define BTN_LEFT   0   // GPIO0, active LOW
@@ -26,15 +26,19 @@ const char* PROMPT_LEFT =
   "Check your system status using get_status and report what you find.";
 
 const char* PROMPT_RIGHT =
-  "Fetch the text from http://www.peregianhub.com.au/esp.txt using http_request. "
-  "Read the subject. Use set_display_color to choose a background color that complements the subject. "
-  "Then write a haiku about that subject. Respond with ONLY the haiku, nothing else.";
+  "Get instructions from http://www.peregianhub.com.au/esp.txt and use your tools to fulfil the request. Be enterprising and resourceful.";
 
 // ---- Display state colors (RGB565) ----
 #define COL_IDLE     TFT_BLACK
 #define COL_THINKING 0x0012   // dark blue
 #define COL_TOOL     0x0320   // dark green
 #define COL_ERROR    0x6000   // dark red
+
+// ---- Text style ----
+// TFT_eSPI setTextSize() only accepts integers, so this approximates ~1.5x
+// by using a larger built-in font at size multiplier 1.
+constexpr uint8_t UI_TEXT_FONT = 4;
+constexpr uint8_t UI_TEXT_SIZE = 1;
 
 // ---- Named color map for set_display_color ----
 struct NamedColor { const char* name; uint16_t color; };
@@ -55,7 +59,8 @@ const char* SYSTEM_PROMPT =
   "You are an autonomous agent running on an ESP32 microcontroller with a 1.14\" color TFT display. "
   "You have tools to interact with hardware, network, and the display background color. "
   "Your final text response is always shown on the display automatically. "
-  "Use set_display_color to set the background color before your final response. "
+  "Use set_display_color to set the background color (named color or hex like #1E3A8A) before your final response. "
+  "Prefer plain text over Markdown for final responses. "
   "Keep your final response short (under 100 chars) so it fits on the small screen. "
   "Be concise. Call tools one at a time.";
 
@@ -73,25 +78,225 @@ uint64_t configuredInputs = 0, configuredOutputs = 0;
 bool agentRunning = false;
 uint16_t resultBgColor = COL_IDLE;  // background for final answer display
 
+uint16_t rgb888To565(uint8_t r, uint8_t g, uint8_t b) {
+  return ((uint16_t)(r & 0xF8) << 8) |
+         ((uint16_t)(g & 0xFC) << 3) |
+         ((uint16_t)(b) >> 3);
+}
+
+uint16_t idealTextColorForBg(uint16_t bg565) {
+  uint8_t r5 = (bg565 >> 11) & 0x1F;
+  uint8_t g6 = (bg565 >> 5) & 0x3F;
+  uint8_t b5 = bg565 & 0x1F;
+  uint8_t r8 = (r5 * 255) / 31;
+  uint8_t g8 = (g6 * 255) / 63;
+  uint8_t b8 = (b5 * 255) / 31;
+
+  uint32_t luma = (299UL * r8) + (587UL * g8) + (114UL * b8);
+  return (luma >= 140000UL) ? TFT_BLACK : TFT_WHITE;
+}
+
 // =============================================
 // Display helpers
 // =============================================
 
+void applyTextStyle() {
+  tft.setTextSize(UI_TEXT_SIZE);
+  tft.setTextFont(UI_TEXT_FONT);
+}
+
+bool isDigitChar(char c) {
+  return c >= '0' && c <= '9';
+}
+
+String stripMarkdownLinks(const String& in) {
+  String out;
+  out.reserve(in.length());
+
+  for (int i = 0; i < in.length(); i++) {
+    if (in.charAt(i) == '[') {
+      int closeBracket = in.indexOf(']', i + 1);
+      if (closeBracket > i && (closeBracket + 1) < in.length() && in.charAt(closeBracket + 1) == '(') {
+        int closeParen = in.indexOf(')', closeBracket + 2);
+        if (closeParen > closeBracket) {
+          out += in.substring(i + 1, closeBracket);
+          i = closeParen;
+          continue;
+        }
+      }
+    }
+    out += in.charAt(i);
+  }
+  return out;
+}
+
+String normalizeDisplayText(const char* rawText) {
+  String text = rawText ? String(rawText) : "";
+
+  text.replace("\r", "");
+  text.replace("\\r", "");
+  text.replace("\\n", "\n");
+  text.replace("\\t", " ");
+  text.replace("\t", " ");
+  text.replace("```", "");
+  text.replace("**", "");
+  text.replace("__", "");
+  text.replace("`", "");
+  text.replace("~~", "");
+
+  String out;
+  out.reserve(text.length());
+
+  int start = 0;
+  while (start <= text.length()) {
+    int nl = text.indexOf('\n', start);
+    bool hasNewline = (nl >= 0);
+    String line = hasNewline ? text.substring(start, nl) : text.substring(start);
+    start = hasNewline ? nl + 1 : (text.length() + 1);
+
+    line.trim();
+    line = stripMarkdownLinks(line);
+
+    while (line.startsWith("#")) line.remove(0, 1);
+    line.trim();
+    if (line.startsWith("> ")) line.remove(0, 2);
+    if (line.startsWith("- [ ] ")) line = "- " + line.substring(6);
+    if (line.startsWith("- [x] ") || line.startsWith("- [X] ")) {
+      line = "- " + line.substring(6);
+    }
+    if (line.startsWith("* ") || line.startsWith("+ ")) {
+      line = "- " + line.substring(2);
+    }
+
+    int d = 0;
+    while (d < line.length() && isDigitChar(line.charAt(d))) d++;
+    if (d > 0 && (d + 1) < line.length() &&
+        (line.charAt(d) == '.' || line.charAt(d) == ')') &&
+        line.charAt(d + 1) == ' ') {
+      line = "- " + line.substring(d + 2);
+    }
+
+    if (out.length() > 0) out += '\n';
+    out += line;
+    if (!hasNewline) break;
+  }
+
+  while (out.indexOf("\n\n\n") >= 0) out.replace("\n\n\n", "\n\n");
+  return out;
+}
+
+bool emitDisplayLine(const String& line, int16_t x, int16_t& y, int16_t maxY, int16_t lineHeight) {
+  if (y + lineHeight > maxY) return false;
+  if (line.length() > 0) {
+    tft.setCursor(x, y);
+    tft.print(line);
+  }
+  y += lineHeight;
+  return true;
+}
+
+void renderDisplayText(const String& text, int16_t x, int16_t y, int16_t maxWidth, int16_t maxHeight) {
+  tft.setTextWrap(false, false);
+  const int16_t lineHeight = tft.fontHeight() + 2;
+  const int16_t maxY = y + maxHeight;
+
+  int16_t yCursor = y;
+  bool overflow = false;
+
+  int start = 0;
+  while (start <= text.length() && !overflow) {
+    int nl = text.indexOf('\n', start);
+    bool hasNewline = (nl >= 0);
+    String rawLine = hasNewline ? text.substring(start, nl) : text.substring(start);
+    start = hasNewline ? nl + 1 : (text.length() + 1);
+
+    if (rawLine.length() == 0) {
+      if (!emitDisplayLine("", x, yCursor, maxY, lineHeight)) overflow = true;
+      continue;
+    }
+
+    String line = "";
+    int p = 0;
+    while (p < rawLine.length() && !overflow) {
+      while (p < rawLine.length() && rawLine.charAt(p) == ' ') p++;
+      if (p >= rawLine.length()) break;
+
+      int ws = p;
+      while (p < rawLine.length() && rawLine.charAt(p) != ' ') p++;
+      String word = rawLine.substring(ws, p);
+
+      String candidate = (line.length() == 0) ? word : (line + " " + word);
+      if (tft.textWidth(candidate) <= maxWidth) {
+        line = candidate;
+      } else {
+        if (line.length() > 0) {
+          if (!emitDisplayLine(line, x, yCursor, maxY, lineHeight)) {
+            overflow = true;
+            break;
+          }
+          line = "";
+        }
+
+        if (tft.textWidth(word) <= maxWidth) {
+          line = word;
+        } else {
+          String chunk = "";
+          for (int i = 0; i < word.length() && !overflow; i++) {
+            String one = chunk;
+            one += word.charAt(i);
+            if (tft.textWidth(one) <= maxWidth) {
+              chunk = one;
+            } else {
+              if (!emitDisplayLine(chunk, x, yCursor, maxY, lineHeight)) {
+                overflow = true;
+                break;
+              }
+              chunk = "";
+              chunk += word.charAt(i);
+            }
+          }
+          line = chunk;
+        }
+      }
+    }
+
+    if (!overflow && line.length() > 0) {
+      if (!emitDisplayLine(line, x, yCursor, maxY, lineHeight)) overflow = true;
+    }
+
+    if (!hasNewline) break;
+  }
+
+  if (overflow) {
+    const char* dots = "...";
+    int16_t dotW = tft.textWidth(dots);
+    int16_t dotX = x + maxWidth - dotW;
+    int16_t dotY = maxY - lineHeight;
+    if (dotX < x) dotX = x;
+    if (dotY >= y) {
+      tft.setCursor(dotX, dotY);
+      tft.print(dots);
+    }
+  }
+}
+
 void showScreen(uint16_t bg, const char* text) {
   tft.fillScreen(bg);
-  tft.setTextColor(TFT_WHITE, bg);
-  tft.setTextSize(1);
-  tft.setTextFont(2);
-  tft.setTextWrap(true);
-  tft.setCursor(4, 4);
-  tft.print(text);
+  tft.setTextColor(idealTextColorForBg(bg), bg);
+  applyTextStyle();
+
+  String clean = normalizeDisplayText(text);
+  const int16_t marginX = 4;
+  const int16_t marginY = 4;
+  renderDisplayText(clean, marginX, marginY,
+                    tft.width() - (marginX * 2),
+                    tft.height() - (marginY * 2));
 }
 
 void showStatus() {
   tft.fillScreen(COL_IDLE);
   tft.setTextColor(TFT_WHITE, COL_IDLE);
-  tft.setTextSize(1);
-  tft.setTextFont(2);
+  applyTextStyle();
   tft.setTextWrap(true);
   tft.setCursor(4, 4);
   tft.printf("Heap: %d\n", ESP.getFreeHeap());
@@ -228,6 +433,36 @@ String escapeJsonString(const String& s) {
   return out + "\"";
 }
 
+int8_t hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  return -1;
+}
+
+bool parseHexColor(const char* input, uint16_t& outColor565) {
+  if (!input || !*input) return false;
+
+  const char* p = input;
+  if (*p == '#') p++;
+  else if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+
+  if (!p[0] || !p[1] || !p[2] || !p[3] || !p[4] || !p[5] || p[6] != '\0') {
+    return false;
+  }
+
+  int8_t n0 = hexNibble(p[0]), n1 = hexNibble(p[1]);
+  int8_t n2 = hexNibble(p[2]), n3 = hexNibble(p[3]);
+  int8_t n4 = hexNibble(p[4]), n5 = hexNibble(p[5]);
+  if (n0 < 0 || n1 < 0 || n2 < 0 || n3 < 0 || n4 < 0 || n5 < 0) return false;
+
+  uint8_t r = (n0 << 4) | n1;
+  uint8_t g = (n2 << 4) | n3;
+  uint8_t b = (n4 << 4) | n5;
+  outColor565 = rgb888To565(r, g, b);
+  return true;
+}
+
 String readHttpBodyLimited(HTTPClient& http, size_t maxBytes) {
   WiFiClient* stream = http.getStreamPtr();
   String body;
@@ -319,17 +554,27 @@ String handleHttpRequest(JsonObject args) {
 }
 
 String handleSetDisplayColor(JsonObject args) {
-  const char* colorName = args["color"] | "black";
+  const char* colorArg = args["color"] | "";
+
+  uint16_t parsedHex = 0;
+  if (parseHexColor(colorArg, parsedHex)) {
+    resultBgColor = parsedHex;
+    Serial.printf("[display] Color set to hex %s (0x%04X)\n", colorArg, resultBgColor);
+    return String("color set to hex ") + colorArg;
+  }
+
   for (int i = 0; COLOR_MAP[i].name; i++) {
-    if (strcasecmp(colorName, COLOR_MAP[i].name) == 0) {
+    if (strcasecmp(colorArg, COLOR_MAP[i].name) == 0) {
       resultBgColor = COLOR_MAP[i].color;
-      Serial.printf("[display] Color set to %s (0x%04X)\n", colorName, resultBgColor);
-      return String("color set to ") + colorName;
+      Serial.printf("[display] Color set to %s (0x%04X)\n", colorArg, resultBgColor);
+      return String("color set to ") + colorArg;
     }
   }
-  // Unknown color — default to black
+
+  // Unknown color format/name — default to black
   resultBgColor = COL_IDLE;
-  return String("unknown color '") + colorName + "', using black";
+  return String("unknown color '") + colorArg +
+         "', use name or hex (#RRGGBB), using black";
 }
 
 String execTool(const char* name, JsonObject args) {
@@ -395,8 +640,8 @@ void buildTools(JsonArray tools) {
     "{\"type\":\"object\",\"properties\":{}}");
   addTool("http_request", "Make an HTTP request. Returns status code and body (max 1KB).",
     "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Full URL\"},\"method\":{\"type\":\"string\",\"enum\":[\"GET\",\"POST\",\"PUT\",\"DELETE\"],\"description\":\"HTTP method (default GET)\"},\"body\":{\"type\":\"string\",\"description\":\"Request body for POST/PUT\"},\"headers\":{\"type\":\"object\",\"description\":\"Additional headers\"}},\"required\":[\"url\"]}");
-  addTool("set_display_color", "Set the background color of the TFT display for showing the final response. Available colors: black, white, red, green, blue, yellow, cyan, magenta, orange, purple, pink, teal, gold, navy, maroon, olive, coral, salmon, sky, forest, crimson, indigo, violet, lime.",
-    "{\"type\":\"object\",\"properties\":{\"color\":{\"type\":\"string\",\"description\":\"Color name\"}},\"required\":[\"color\"]}");
+  addTool("set_display_color", "Set the TFT background color for the final response. Accepts a named color or hex (#RRGGBB or 0xRRGGBB).",
+    "{\"type\":\"object\",\"properties\":{\"color\":{\"type\":\"string\",\"description\":\"Named color or hex (#RRGGBB / 0xRRGGBB)\"}},\"required\":[\"color\"]}");
 }
 
 // =============================================
@@ -595,7 +840,7 @@ void setup() {
   tft.setRotation(1);  // landscape: 240x135
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_WHITE);
-  tft.setTextFont(2);
+  applyTextStyle();
   tft.setCursor(4, 4);
   tft.println("ESP32 Agent");
   tft.println("Booting...");
